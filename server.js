@@ -1,17 +1,19 @@
 import express from "express";
 import dotenv from "dotenv";
-import OpenAI from "openai";
 import axios from "axios";
+import OpenAI from "openai";
+import fs from "fs";
+import path from "path";
 
 dotenv.config();
 
-console.log("🚀 CHATWOOT GPT BOT — STAGE 2 FINAL + FALLBACK");
+console.log("🚀 CHATWOOT GPT BOT — STAGE 3 (RAG + SOFT SUPPORT HINT)");
 
-// ================= APP =================
+/* ================= APP ================= */
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ================= CONFIG =================
+/* ================= CONFIG ================= */
 const PORT = Number(process.env.BOT_PORT || 5005);
 
 const CHATWOOT_URL = process.env.CHATWOOT_URL;
@@ -25,31 +27,13 @@ const OPERATOR_ASSIGNEE_ID = process.env.OPERATOR_ASSIGNEE_ID
   ? Number(process.env.OPERATOR_ASSIGNEE_ID)
   : null;
 
-const GPT_TIMEOUT = 15000;
-const OPERATOR_FALLBACK_TIMEOUT = 3 * 60 * 1000; // 3 минуты
-
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ================= STATE =================
-const memory = new Map();
+/* ================= STATE ================= */
 const greeted = new Set();
 const handedOver = new Set();
-const fallbackTimers = new Map();
 
-// ================= STATS =================
-const stats = {
-  totalIncoming: 0,
-  greeted: 0,
-  gptReplies: 0,
-  operatorHandoffs: 0,
-  operatorFallbacks: 0,
-  handoffReasons: {
-    manual: 0,
-    timeout: 0,
-  },
-};
-
-// ================= UTILS =================
+/* ================= UTILS ================= */
 const normalize = (t) =>
   String(t || "")
     .toLowerCase()
@@ -58,22 +42,36 @@ const normalize = (t) =>
     .replace(/\s+/g, " ")
     .trim();
 
+/**
+ * ❗ ТОЛЬКО ЯВНЫЙ ЗАПРОС ОПЕРАТОРА
+ */
 const wantsOperator = (text) => {
   const t = normalize(text);
   return (
-    t.includes("оператор") ||
-    t.includes("человек") ||
-    t.includes("соед") ||
-    t.includes("менеджер") ||
-    t.includes("поддерж")
+    t.includes("соедини с оператором") ||
+    t.includes("соедините с оператором") ||
+    t.includes("нужен оператор") ||
+    t.includes("хочу оператора") ||
+    t.includes("живой оператор") ||
+    t.includes("человек оператор")
   );
 };
 
-// ================= CHATWOOT API =================
-const cw = (path) =>
-  `${CHATWOOT_URL}/api/v1/accounts/${ACCOUNT_ID}${path}`;
+/**
+ * 🟡 МЯГКИЙ НАМЁК НА ПОДДЕРЖКУ (НЕ handoff)
+ */
+const looksLikeSupportRequest = (text) => {
+  const t = normalize(text);
+  return t.includes("помощ") || t.includes("поддерж");
+};
 
-const headers = { api_access_token: CHATWOOT_API_KEY };
+/* ================= CHATWOOT API ================= */
+const cw = (p) =>
+  `${CHATWOOT_URL}/api/v1/accounts/${ACCOUNT_ID}${p}`;
+
+const headers = {
+  api_access_token: CHATWOOT_API_KEY,
+};
 
 async function sendMessage(conversationId, content) {
   await axios.post(
@@ -84,13 +82,11 @@ async function sendMessage(conversationId, content) {
 }
 
 async function addPrivateNote(conversationId, content) {
-  try {
-    await axios.post(
-      cw(`/conversations/${conversationId}/messages`),
-      { content, private: true },
-      { headers }
-    );
-  } catch {}
+  await axios.post(
+    cw(`/conversations/${conversationId}/messages`),
+    { content, private: true },
+    { headers }
+  );
 }
 
 async function assignConversation(conversationId) {
@@ -103,66 +99,72 @@ async function assignConversation(conversationId) {
   );
 }
 
-// ================= GPT =================
-async function askGPT(messages) {
-  return Promise.race([
-    openai.chat.completions.create({
-      model: OPENAI_MODEL,
-      temperature: 0.4,
-      messages: [
-        {
-          role: "system",
-          content:
-            "Ты ИИ ассистент поддержки. Отвечай ТОЛЬКО на русском языке, кратко и по делу.",
-        },
-        ...messages,
-      ],
-    }),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("GPT_TIMEOUT")), GPT_TIMEOUT)
-    ),
-  ]);
-}
+/* ================= RAG: LOAD KNOWLEDGE ================= */
+const KNOWLEDGE_DIR = path.join(process.cwd(), "knowledge");
 
-// ================= FALLBACK =================
-function scheduleFallback(conversationId) {
-  if (fallbackTimers.has(conversationId)) return;
+function loadKnowledge() {
+  const files = fs.readdirSync(KNOWLEDGE_DIR);
+  const chunks = [];
 
-  const timer = setTimeout(async () => {
-    if (!handedOver.has(conversationId)) return;
-
-    handedOver.delete(conversationId);
-    fallbackTimers.delete(conversationId);
-    stats.operatorFallbacks++;
-
-    await addPrivateNote(
-      conversationId,
-      "🔁 Оператор не ответил — бот продолжил диалог"
+  for (const file of files) {
+    const content = fs.readFileSync(
+      path.join(KNOWLEDGE_DIR, file),
+      "utf-8"
     );
 
-    await sendMessage(
-      conversationId,
-      "Похоже, оператор пока не подключился. Я продолжу помогать вам."
-    );
-  }, OPERATOR_FALLBACK_TIMEOUT);
+    const parts = content
+      .split("\n")
+      .map(p => p.trim())
+      .filter(p => p.length > 20);
 
-  fallbackTimers.set(conversationId, timer);
-}
-
-function cancelFallback(conversationId) {
-  if (fallbackTimers.has(conversationId)) {
-    clearTimeout(fallbackTimers.get(conversationId));
-    fallbackTimers.delete(conversationId);
+    for (const part of parts) {
+      chunks.push({
+        source: file,
+        text: part,
+      });
+    }
   }
+
+  return chunks;
 }
 
-// ================= HEALTH =================
-app.get("/health", (req, res) => res.json({ ok: true }));
+const KNOWLEDGE_BASE = loadKnowledge();
+console.log(`📚 Загружено фрагментов базы знаний: ${KNOWLEDGE_BASE.length}`);
 
-// ================= STATS =================
-app.get("/stats", (req, res) => res.json(stats));
+/* ================= RAG: RETRIEVAL ================= */
+const STOP_WORDS = new Set([
+  "и","в","во","на","а","но","что","как","какой","какая","какие",
+  "когда","где","ли","это","по","с","у","за","от","до","или",
+  "либо","же","бы","время","какое"
+]);
 
-// ================= WEBHOOK =================
+function retrieveContext(question) {
+  const words = normalize(question)
+    .split(" ")
+    .filter(w => w.length > 2 && !STOP_WORDS.has(w));
+
+  const scored = KNOWLEDGE_BASE.map(chunk => {
+    let score = 0;
+    for (const word of words) {
+      if (chunk.text.toLowerCase().includes(word)) {
+        score++;
+      }
+    }
+    return { ...chunk, score };
+  });
+
+  return scored
+    .filter(c => c.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+}
+
+/* ================= HEALTH ================= */
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
+
+/* ================= WEBHOOK ================= */
 app.post("/webhook", async (req, res) => {
   try {
     const payload = req.body;
@@ -174,13 +176,7 @@ app.post("/webhook", async (req, res) => {
     const conversationId = payload.conversation?.id;
     if (!conversationId) return res.sendStatus(200);
 
-    // 🔥 если оператор написал — отменяем fallback
-    if (payload.message_type === "outgoing") {
-      cancelFallback(conversationId);
-      return res.sendStatus(200);
-    }
-
-    // 🔥 только сообщения клиента
+    // анти-луп
     if (payload.message_type !== "incoming") {
       return res.sendStatus(200);
     }
@@ -188,75 +184,84 @@ app.post("/webhook", async (req, res) => {
     const text = payload.content?.trim();
     if (!text) return res.sendStatus(200);
 
-    stats.totalIncoming++;
-
-    // если у оператора — бот молчит
     if (handedOver.has(conversationId)) {
       return res.sendStatus(200);
     }
 
-    // 👋 приветствие
-    if (!greeted.has(conversationId) && !memory.has(conversationId)) {
+    // приветствие
+    if (!greeted.has(conversationId)) {
       greeted.add(conversationId);
-      stats.greeted++;
       await sendMessage(conversationId, "Здравствуйте! Чем могу помочь?");
       return res.sendStatus(200);
     }
 
-    // 🧑‍💼 запрос оператора
+    // явный запрос оператора
     if (wantsOperator(text)) {
       handedOver.add(conversationId);
-      stats.operatorHandoffs++;
-      stats.handoffReasons.manual++;
-
-      await addPrivateNote(
-        conversationId,
-        "🧑‍💼 Диалог передан оператору по запросу клиента"
-      );
-
       await sendMessage(
         conversationId,
         "Передаю диалог оператору. Пожалуйста, подождите."
       );
-      await assignConversation(conversationId);
-      scheduleFallback(conversationId);
-      return res.sendStatus(200);
-    }
-
-    // ===== GPT =====
-    const history = memory.get(conversationId) || [];
-    history.push({ role: "user", content: text });
-
-    let answer;
-    try {
-      const completion = await askGPT(history.slice(-10));
-      answer = completion.choices?.[0]?.message?.content;
-    } catch {
-      handedOver.add(conversationId);
-      stats.operatorHandoffs++;
-      stats.handoffReasons.timeout++;
-
       await addPrivateNote(
         conversationId,
-        "⏱ GPT не ответил — диалог передан оператору"
+        "🧑‍💼 Диалог передан оператору по запросу клиента"
       );
-
       await assignConversation(conversationId);
-      scheduleFallback(conversationId);
       return res.sendStatus(200);
     }
 
-    history.push({ role: "assistant", content: answer });
-    memory.set(conversationId, history);
+    /* ================= RAG ================= */
+    const contextChunks = retrieveContext(text);
 
-    stats.gptReplies++;
+    if (contextChunks.length === 0) {
+      handedOver.add(conversationId);
+      await sendMessage(
+        conversationId,
+        "К сожалению, у меня нет информации по этому вопросу. Я передаю диалог оператору."
+      );
+      await addPrivateNote(
+        conversationId,
+        "📚 В базе знаний нет ответа — диалог передан оператору"
+      );
+      await assignConversation(conversationId);
+      return res.sendStatus(200);
+    }
 
-    await addPrivateNote(
-      conversationId,
-      "🧠 GPT ответил пользователю"
-    );
+    const contextText = contextChunks
+      .map(c => `• ${c.text}`)
+      .join("\n");
+
+    const completion = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Ты ассистент поддержки. Отвечай ТОЛЬКО на основе контекста ниже. " +
+            "Если ответа нет в контексте — честно скажи, что информации нет.",
+        },
+        {
+          role: "user",
+          content:
+            `Контекст:\n${contextText}\n\nВопрос пользователя:\n${text}`,
+        },
+      ],
+    });
+
+    let answer =
+      completion.choices?.[0]?.message?.content ||
+      "Извините, я не смог найти ответ.";
+
+    // 🟡 мягкая подсказка про оператора
+    if (looksLikeSupportRequest(text)) {
+      answer +=
+        "\n\nЕсли вам нужен живой оператор, напишите: «соедини с оператором».";
+    }
 
     await sendMessage(conversationId, answer);
+    await addPrivateNote(conversationId, "🧠 GPT ответил пользователю");
+
     return res.sendStatus(200);
 
   } catch (e) {
@@ -265,7 +270,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ================= START =================
+/* ================= START ================= */
 app.listen(PORT, () => {
   console.log(`🚀 Bot running → http://localhost:${PORT}/webhook`);
 });

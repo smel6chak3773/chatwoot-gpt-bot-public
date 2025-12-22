@@ -1,0 +1,26 @@
+# env
+.env
+
+# macOS
+.DS_Store
+
+# local backups
+server.WORKING.*.js
+
+# node
+node_modules/
+
+# logs
+npm-debug.log*
+.env
+.DS_Store
+node_modules
+Documents/
+_archive/
+actions/
+data/
+utils/
+# local server backups / stages
+server.*.js
+!server.js
+

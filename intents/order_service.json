@@ -1,0 +1,10 @@
+{
+  "intent": "order_service",
+  "steps": [
+    "ask_service",
+    "ask_budget",
+    "ask_deadline",
+    "confirm",
+    "lead"
+  ]
+}

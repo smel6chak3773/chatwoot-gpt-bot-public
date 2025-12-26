@@ -4,9 +4,12 @@ import OpenAI from "openai";
 import axios from "axios";
 import state from "./state/index.js";
 
+import { handleDtp } from "./scenarios/dtp/index.js";
+import { handleBreakdown } from "./scenarios/breakdown/index.js";
+
 dotenv.config();
 
-console.log("🚀 CHATWOOT GPT BOT — STAGE 3 (STATE READY)");
+console.log("🚀 CHATWOOT GPT BOT — STAGE 3 + SOS SCENARIOS");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -42,15 +45,9 @@ const wantsOperator = (text) => {
   const phrases = [
     "соедини с оператором",
     "соедините с оператором",
-    "соедени с оператором",
-    "соеденить с оператором",
     "хочу оператора",
-    "позови оператора",
     "поговорить с оператором",
-    "поговорить с человеком",
-    "нужен оператор",
     "нужен человек",
-    "хочу менеджера",
   ];
   return phrases.some((p) => t.includes(p));
 };
@@ -59,13 +56,7 @@ const wantsOperator = (text) => {
 const BOT_RULES = [
   {
     match: ["график", "время работы", "режим работы"],
-    answer:
-      "Поддержка работает ежедневно с 9:00 до 18:00 по местному времени.",
-  },
-  {
-    match: ["нужна помощь", "помощь поддержки", "служба поддержки"],
-    answer:
-      "Вы можете использовать чат поддержки или запросить оператора.\n\nЕсли вам нужен живой оператор, напишите: «соедини с оператором».",
+    answer: "Поддержка работает ежедневно с 9:00 до 18:00.",
   },
 ];
 
@@ -107,14 +98,26 @@ app.post("/webhook", async (req, res) => {
 
     if (handedOver.has(conversationId)) return res.sendStatus(200);
 
+    // ===== INIT SESSION =====
+    let session = state.get(conversationId);
+    if (!session || Array.isArray(session)) {
+      session = {
+        history: Array.isArray(session) ? session : [],
+        scenario: null,
+      };
+      state.set(conversationId, session);
+    }
+    if (!Array.isArray(session.history)) session.history = [];
+
+    // ===== GREETING =====
     if (!greeted.has(conversationId)) {
       greeted.add(conversationId);
       await sendMessage(conversationId, "Здравствуйте! Чем могу помочь?");
       return res.sendStatus(200);
     }
 
+    // ===== BOT RULES =====
     const normalized = normalize(text);
-
     for (const rule of BOT_RULES) {
       if (rule.match.some((m) => normalized.includes(m))) {
         await sendMessage(conversationId, rule.answer);
@@ -122,6 +125,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
+    // ===== OPERATOR =====
     if (wantsOperator(text)) {
       handedOver.add(conversationId);
       await sendMessage(
@@ -132,8 +136,41 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const history = state.get(conversationId);
-    history.push({ role: "user", content: text });
+    // ===== SOS: ДТП =====
+    const dtpHandled = await handleDtp(
+      { message: text },
+      {
+        conversationId,
+        chatwootUrl: CHATWOOT_URL,
+        token: CHATWOOT_API_KEY,
+        openai,
+      },
+      session
+    );
+
+    if (dtpHandled) {
+      state.set(conversationId, session);
+      return res.sendStatus(200);
+    }
+
+    // ===== SOS: ПОЛОМКА =====
+    const breakdownHandled = await handleBreakdown(
+      { message: text },
+      {
+        conversationId,
+        chatwootUrl: CHATWOOT_URL,
+        token: CHATWOOT_API_KEY,
+      },
+      session
+    );
+
+    if (breakdownHandled) {
+      state.set(conversationId, session);
+      return res.sendStatus(200);
+    }
+
+    // ===== GPT SUPPORT =====
+    session.history.push({ role: "user", content: text });
 
     const completion = await openai.chat.completions.create({
       model: OPENAI_MODEL,
@@ -144,7 +181,7 @@ app.post("/webhook", async (req, res) => {
           content:
             "Ты ИИ ассистент поддержки. Отвечай кратко и по делу, на русском языке.",
         },
-        ...history.slice(-6),
+        ...session.history.slice(-6),
       ],
     });
 
@@ -152,13 +189,13 @@ app.post("/webhook", async (req, res) => {
       completion.choices?.[0]?.message?.content ||
       "Пожалуйста, уточните вопрос.";
 
-    history.push({ role: "assistant", content: answer });
-    state.set(conversationId, history);
+    session.history.push({ role: "assistant", content: answer });
+    state.set(conversationId, session);
 
     await sendMessage(conversationId, answer);
     return res.sendStatus(200);
   } catch (e) {
-    console.error("❌ ERROR:", e.message);
+    console.error("❌ ERROR:", e);
     return res.sendStatus(500);
   }
 });
